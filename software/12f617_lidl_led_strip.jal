@@ -1,0 +1,426 @@
+; ==============================================================================
+; Title: Lidl LED Strip controller with Remote Control functionality.
+; Author: Rob Jansen, Copyright (c) 2024..2024, all rights reserved.
+; Compiler: 2.5r8
+;
+; Revision:
+; 2024-12-01 : Initial version. 
+;
+; Description: Changing the color of 3 RGB LEDs which are part of a LED
+;              strip. At power on the LEDs color and duration change randomly. 
+;              When a Remote Control with the NEC Remote Control format is used, 
+;              the LEDs will use the colors given on the Remote Control.
+;
+; Sources: -) NEC RC Sample program for the Remote Control part.
+;          -) Pieces of code of the lluminated cubes project.
+;
+; Remote control button layout and corresponding command: Address is always 000:
+; ------------------------------------------------------------------------------
+; Bright up     = 005   Bright down = 004   Off         = 006   On     = 007   
+; Red           = 009   Green       = 008   Blue        = 010   White  = 011
+; LightRed      = 013   LightGreen  = 012   DarkBlue    = 014   Flash  = 015
+; Orange        = 021   LightBlue   = 020   Blue/Purple = 022   Strobe = 023
+; LightOrange   = 025   Green/Blue  = 024   Purple      = 026   Fade   = 027
+; Yellow        = 017   Blue/Green  = 016   Pink        = 018   Smooth = 019
+;
+;===============================================================================
+
+include 12f617                         ; target PICmicro
+
+; Use internal clock and internal reset.
+pragma target clock    8_000_000       ; Oscillator frequency 8 MHz.
+pragma target OSC      INTOSC_NOCLKOUT ; Internal Clock.
+pragma target PWRTE    Enabled         ; Power up timer.
+pragma target MCLR     Internal        ; Reset internal.
+pragma target WDT      Disabled        ; No watchdog.
+pragma target BROWNOUT Disabled        ; No brownout reset.
+pragma target IOSCFS   F8MHZ           ; Set internal oscillator to 8 MHz.
+
+; ================================= Pins ======================================
+
+; LED control, active high. Driving transistors.
+const bit LED_ON  = TRUE     
+const bit LED_OFF = FALSE
+
+; LED pin definitions.
+alias led_red is pin_GP1   ; Pin 6 for 8 pin DIP. 
+led_red = LED_OFF          ; First put off before making output.
+pin_GP1_direction =  output
+alias led_green is pin_GP0 ; Pin 7 for 8 pin DIP.  
+led_green = LED_OFF        ; First put off before making output.
+pin_GP0_direction =  output
+alias led_blue is pin_GP5 ; Pin 2 for 8 pin DIP.  
+led_blue = LED_OFF        ; First put off before making output.
+pin_GP5_direction =  output
+
+; Make all pins digital instead of analog.
+enable_digital_io()
+; Give the hardware some time to stabilize.
+_usec_delay(100_000) 
+
+; Settings for the NEC Remote Control Decoder. Decoder times are based
+; on Timer 1 running at 1.0 MHz. Settings for Timer 1:
+; -) Use Fosc/4. This gives 2 MHz.
+; -) Use a prescaler of 1:2 This gives 1 MHz.
+T1CON_TMR1CS = FALSE ; Clock source Fosc/4 gives 2 MHz.
+T1CON_T1CKPS = 0b01  ; Prescaler 1:2 gives 1 MHz.
+; We do not need clock scaling (see sample program for more info).
+; Define the interrupt pin.
+alias nec_rc_decoder_pin_direction is pin_GP2_direction 
+; Now we can include the library.
+include nec_rc_decoder
+
+; Not used pin.
+pin_GP4_direction = OUTPUT
+pin_GP4 = LOW
+; ========================== Constant declarations ============================
+
+; Constants to keep the LEDs on for some time, expressed in 100 ms ticks.
+const word NO_ON_TIME  = 0  
+const word MIN_ON_TIME = 600  ; 1 minute.
+const word MAX_ON_TIME = 1800 ; 3 minutes.
+
+; See timer init, 8771 Hz / 125 gives 70 Hz. 
+const byte PWM_PERIOD_TIME = 125
+
+; Constant to get a 100 milisecond timer.
+const word TIMER_100_MS = 877 ; Timer 2 runs at 8771 Hz.  
+
+; Specify the values for the minimum and maximum brightness of the LED.
+const byte MIN_BRIGHT  = 50  ; LEDs never go off completely.
+const byte MAX_BRIGHT  = 250 ; Keep some margin for STEP_BRIGHT. 
+const byte STEP_BRIGHT = 2
+
+; We will only initalize the random generator with this seed if the intial
+; value is 0 since that is not allowed for the random generator.
+const word RANDOM_SEED = 0xACE1
+
+; Remote control constants.
+const byte RC_ADDRESS     = 000
+const byte RC_COMMAND_ON  = 007
+const byte RC_COMMAND_OFF = 006
+
+; Translation table of remote control commands to RGB colors.
+record rc_rgb is          
+   byte command ; Remote control command.
+   byte red     ; Brightness of the red LED.
+   byte green   ; Brightness of the green LED.
+   byte blue    ; Brightness of the blue LED.
+end record
+
+; Remote control commands and there corresponding colors.
+; Only colors are used, no features. Used this site to get the values:
+; https://www.rapidtables.com/web/color/RGB_Color.html
+const rc_rgb rc_to_color[] = { 
+   ; Red                  Green                  Blue                 White
+   {009, 255, 000, 000}, {008, 000, 255, 000}, {010, 000, 000, 255}, {011, 255, 255, 255} ,
+   ; LightRed             LightGreen             DarkBlue
+   {013, 255, 102, 102}, {012, 178, 255, 102}, {014, 000, 000, 153}, 
+   ; Orange               LightBlue              Blue/Purple
+   {021, 255, 128, 000}, {020, 000, 255, 255}, {022, 086, 255, 153}, 
+   ; LightOrange          Green/Blue             Purple
+   {025, 255, 178, 102}, {024, 000, 255, 128}, {026, 204, 000, 204}, 
+   ; Yellow               Blue/Green             Pink
+   {017, 255, 255, 000}, {016, 000, 153, 076}, {018, 255, 051, 255} 
+}
+
+; ========================== Variable declarations ============================
+
+var word random_shift_word
+var word led_red_on_time, led_green_on_time, led_blue_on_time    
+var word timer_counter             
+var byte pwm_period, new_brightness
+var byte led_red_timer, led_green_timer, led_blue_timer
+var byte led_red_duty_cycle, led_green_duty_cycle, led_blue_duty_cycle 
+var byte led_red_max_bright, led_green_max_bright, led_blue_max_bright
+var byte address, command, index
+var bit  led_red_fade_in, led_green_fade_in, led_blue_fade_in      
+var bit  timer_tick, rc_active
+
+; ========================= Functions and Procedures ==========================
+
+; Generate a new random number using a Linear Feedback Shift Register (LFSR).
+; 16 bit shift register used to generate a random number. It generates all
+; numbers between 0x0001 and 0xFFFF and has to be started with a seed.
+; See http://en.wikipedia.org/wiki/Linear_feedback_shift_register
+function give_random_word return word is
+var word value
+   ; Use Fibonacci LSFR x16 + x14 + x13 + x11 + 1
+   value = (random_shift_word ^ (random_shift_word >> 2) ^
+           (random_shift_word >> 3) ^ (random_shift_word >> 5)) & 0x0001
+   random_shift_word = (random_shift_word >> 1) | (value << 15)
+   return random_shift_word
+end function 
+
+
+; Return a random maximum brightness value. 
+; Returned value is always >= MIN_BRIGHT.
+function give_random_brightness() return byte is
+   
+   var byte random_brightness
+   
+   random_brightness = byte(give_random_word())
+   if (random_brightness < MIN_BRIGHT) then
+      random_brightness = random_brightness + MIN_BRIGHT
+   end if 
+
+   return random_brightness
+
+end function
+
+
+; This function returns a random on time.
+; Returned value is always >= MIN_ON_TIME and < MAX_ON_TIME.
+function give_random_on_time() return word is
+
+   var word random_time
+   
+   random_time = give_random_word() % MAX_ON_TIME
+
+   if (random_time < MIN_ON_TIME) then
+      random_time = random_time + MIN_ON_TIME
+   end if    
+
+   return random_time
+
+end function
+
+
+; Initialize the LEDs and related variables.
+procedure led_init() is
+
+   ; Start with all LEDs off.
+   led_red   = LED_OFF
+   led_green = LED_OFF
+   led_blue  = LED_OFF
+
+   ; Initialze the RGB leds.
+   ; Red.
+   led_red_max_bright = 0
+   led_red_on_time = NO_ON_TIME
+   led_red_fade_in = FALSE    
+   ; Green.
+   led_green_max_bright = 0
+   led_green_on_time = NO_ON_TIME
+   led_green_fade_in = FALSE    
+   ; Blue.
+   led_blue_max_bright = 0
+   led_blue_on_time = NO_ON_TIME
+   led_blue_fade_in = FALSE   
+ 
+   ; Start with all LEDs off so no duty cycle.
+   led_red_duty_cycle = 0 
+   led_green_duty_cycle = 0
+   led_blue_duty_cycle = 0
+
+end procedure
+
+
+; Initialization procedure for setting up the software PWM using timer 2. 
+; We need a frequency higher than what the eye can see (period) and due  
+; to the step increment of STEP_BRIGHT (duty cycle) the timer need to run at 
+; MAX_BRIGHT / STEP_BRIGHT = 125 times that speed. If we go for a 70 Hz 
+; period then the timer should run at 8750 Hz or a period time of 114 us. 
+procedure pwm_init() is
+
+   ; Initialize LEDs and some other variables.
+   led_init()
+   timer_counter = TIMER_100_MS
+   timer_tick = FALSE
+
+   ; Register PR2 holds the Timer Period using the following formula:
+   ; Period = (PR2 + 1) * 4 * Tosc * Timer2 prescale value
+   ; where Tosc = 1/Fosc and Fosc = 8.000.000 Hz.
+   ; With a PR2 reload value of 226 and no prescaler
+   ; Period = (227 + 1) * 4 * 1/8.000.000 * 1 =  114 us or 8772 HZ
+   T2CON_TMR2ON = FALSE  ; Timer 2 off
+   T2CON_TOUTPS = 0b0000 ; Postscaler is 1:1
+   T2CON_T2CKPS = 0b00   ; Prescaler divide by 1
+   PR2          = 227    ; Reload value.
+   pwm_period   = 0      ; Starts a new period
+   PIR1_TMR2IF  = FALSE  ; Clear Timer 2 interrupt flag.
+   PIE1_TMR2IE  = TRUE   ; Enable Timer 2 interrupt
+   INTCON_PEIE  = TRUE   ; Enable periperal interrupt.
+   INTCON_GIE   = TRUE   ; Enable global interrupt.
+   T2CON_TMR2ON = TRUE   ; Start Timer 2
+
+end procedure
+
+
+; This interrupt procedure controls the PWM cycle using Timer 2. It controls
+; the full operation of the leds. LEDs are switched on at the start of a new
+; pwm period and are switched off when the duty cycle has passed.
+; The routine is called every 114 us and takes around 50 us.
+procedure pwm_cycle is pragma interrupt
+
+   if PIR1_TMR2IF & PIE1_TMR2IE then
+      PIR1_TMR2IF = FALSE
+
+      ; First check the if we need to start a new period.
+      if (pwm_period == 0) then
+         ; New period. Switch LEDs on and start a new duty cycle.
+         pwm_period = PWM_PERIOD_TIME
+         led_red_timer = led_red_duty_cycle
+         led_green_timer = led_green_duty_cycle
+         led_blue_timer = led_blue_duty_cycle
+
+         ; Only turn LED on if it has a duty cycle to prevent flashing.
+         if (led_red_timer >= MIN_BRIGHT) then
+            led_red = LED_ON
+         end if
+         if (led_green_timer >= MIN_BRIGHT) then
+            led_green = LED_ON
+         end if
+         if (led_blue_timer >= MIN_BRIGHT) then
+            led_blue = LED_ON
+         end if
+      else
+         pwm_period = pwm_period - 1
+      end if
+      
+      ; If the timer of the LED is at the lowest brightness 
+      ; then the duty cycle time has passed.
+      if (led_red_timer >= MIN_BRIGHT) then
+         led_red_timer = led_red_timer - STEP_BRIGHT
+      else 
+         led_red = LED_OFF
+      end if 
+      if (led_green_timer >= MIN_BRIGHT) then
+         led_green_timer = led_green_timer - STEP_BRIGHT
+      else 
+         led_green = LED_OFF
+      end if 
+      if (led_blue_timer >= MIN_BRIGHT) then
+         led_blue_timer = led_blue_timer - STEP_BRIGHT
+      else 
+         led_blue = LED_OFF
+      end if 
+
+      ; Check for 100 ms to have passed.
+      if (timer_counter == 0) then
+         timer_counter = TIMER_100_MS
+         timer_tick = TRUE
+      else
+         timer_counter = timer_counter - 1
+      end if 
+      
+   end if 
+end procedure 
+
+
+; ========================= Main program starts here ==========================
+
+; We do not initialze the seed for the random generator as to have a different
+; random seed at every reset or power up. We do have to check if the seed for 
+; the random generator is not 0 since that is not allowed.
+if (random_shift_word == 0) then
+   random_shift_word = RANDOM_SEED
+end if 
+
+; Initialize some stuff. 
+nec_rc_decoder_init()
+pwm_init()
+rc_active = FALSE
+
+forever Loop
+
+   ; First see if we are using the remote control. We ignore repeat messages.
+   if nec_rc_message_received() then
+      nec_rc_get_data_standard(address, command)
+      if (address == RC_ADDRESS) then
+         if rc_active then
+         
+            ; See if this command is a color command. Look it up.
+            for count(rc_to_color) using index loop
+               if (rc_to_color[index].command == command) then
+                  led_red_duty_cycle = rc_to_color[index].red
+                  led_green_duty_cycle = rc_to_color[index].green
+                  led_blue_duty_cycle = rc_to_color[index].blue
+               end if 
+            end loop
+            
+            ; It could also be an Off command.
+            if (command == RC_COMMAND_OFF) then
+               ; Off means go back to the random LED pattern.
+               led_init()
+               rc_active = FALSE
+            end if 
+
+         elsif (command == RC_COMMAND_ON) then
+            ; Remote Contol mode, set all LEDs to maximum brightness.
+            led_red_duty_cycle = MAX_BRIGHT
+            led_green_duty_cycle = MAX_BRIGHT
+            led_blue_duty_cycle = MAX_BRIGHT
+            rc_active = TRUE
+         end if 
+      end if 
+   end if ; nec_rc_message_received
+
+   ; The main loop runs at a timer tick of 100 miliseconds. This reference time 
+   ; is used for phase in and phase out of the LEDs and the on-time and  
+   ; off-time of the LEDs. This loop only runs when no remote control is used.
+   if (timer_tick & !rc_active) then
+      timer_tick = FALSE
+      
+      ; Check if we need to change the colors of the LEDs and the on-time.
+      if (led_red_on_time == NO_ON_TIME) then
+         new_brightness = give_random_brightness()
+         led_red_fade_in = (new_brightness > led_red_max_bright)
+         led_red_max_bright = new_brightness
+         led_red_on_time = give_random_on_time() 
+      else
+         led_red_on_time = led_red_on_time - 1
+      end if 
+
+      if (led_green_on_time == NO_ON_TIME) then
+         new_brightness = give_random_brightness()
+         led_green_fade_in = (new_brightness > led_green_max_bright)
+         led_green_max_bright = new_brightness
+         led_green_on_time = give_random_on_time()  
+      else
+         led_green_on_time = led_green_on_time - 1
+      end if 
+     
+      if (led_blue_on_time == NO_ON_TIME) then
+         new_brightness = give_random_brightness()
+         led_blue_fade_in = (new_brightness > led_blue_max_bright)
+         led_blue_max_bright = new_brightness
+         led_blue_on_time = give_random_on_time() 
+      else
+         led_blue_on_time = led_blue_on_time - 1
+      end if 
+
+      ; Handle fade-in and fade-out of all LEDs. Fading is done in small steps.
+      if led_red_fade_in then
+         if (led_red_duty_cycle < led_red_max_bright) then
+            led_red_duty_cycle = led_red_duty_cycle + STEP_BRIGHT
+         end if   
+      else  
+         if led_red_duty_cycle >= MIN_BRIGHT then
+            led_red_duty_cycle = led_red_duty_cycle - STEP_BRIGHT
+         end if     
+      end if
+      
+      if led_green_fade_in then
+         if (led_green_duty_cycle < led_green_max_bright) then
+            led_green_duty_cycle = led_green_duty_cycle + STEP_BRIGHT
+         end if     
+      else
+         if led_green_duty_cycle >= MIN_BRIGHT then
+            led_green_duty_cycle = led_green_duty_cycle - STEP_BRIGHT
+         end if     
+      end if
+   
+      if led_blue_fade_in then
+         if (led_blue_duty_cycle < led_blue_max_bright) then
+            led_blue_duty_cycle = led_blue_duty_cycle + STEP_BRIGHT
+         end if     
+      else
+         if led_blue_duty_cycle >= MIN_BRIGHT then
+            led_blue_duty_cycle = led_blue_duty_cycle - STEP_BRIGHT
+         end if     
+      end if
+  
+    end if ; timer_tick & !rc_active
+
+end loop 
