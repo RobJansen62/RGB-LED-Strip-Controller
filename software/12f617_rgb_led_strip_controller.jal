@@ -5,6 +5,7 @@
 ;
 ; Revision:
 ; 2024-12-01 : Initial version. 
+; 2024-12-22 : Small fix. Random colors should not turn all LEDs off.
 ;
 ; Description: Changing the color of 3 RGB LEDs which are part of a LED
 ;              strip. At power on the LEDs color and duration change randomly. 
@@ -80,16 +81,15 @@ const word NO_ON_TIME  = 0
 const word MIN_ON_TIME = 600  ; 1 minute.
 const word MAX_ON_TIME = 1800 ; 3 minutes.
 
-; See timer init, 8771 Hz / 125 gives 70 Hz. 
-const byte PWM_PERIOD_TIME = 125
-
 ; Constant to get a 100 milisecond timer.
 const word TIMER_100_MS = 877 ; Timer 2 runs at 8771 Hz.  
 
 ; Specify the values for the minimum and maximum brightness of the LED.
-const byte MIN_BRIGHT  = 50  ; LEDs never go off completely.
-const byte MAX_BRIGHT  = 250 ; Keep some margin for STEP_BRIGHT. 
+const byte MIN_BRIGHT  = 20  ; LEDs never go off completely.
+const byte MAX_BRIGHT  = 250  ; LED higher brightness end value.
 const byte STEP_BRIGHT = 2
+; See timer init, 8772 Hz / 125 gives 70 Hz. 
+const byte PWM_PERIOD_TIME = MAX_BRIGHT / STEP_BRIGHT
 
 ; We will only initalize the random generator with this seed if the intial
 ; value is 0 since that is not allowed for the random generator.
@@ -132,9 +132,9 @@ var word timer_counter
 var byte pwm_period, new_brightness
 var byte led_red_timer, led_green_timer, led_blue_timer
 var byte led_red_duty_cycle, led_green_duty_cycle, led_blue_duty_cycle 
-var byte led_red_max_bright, led_green_max_bright, led_blue_max_bright
+var byte led_red_brightness, led_green_brightness, led_blue_brightness
 var byte address, command, index
-var bit  led_red_fade_in, led_green_fade_in, led_blue_fade_in      
+var bit  led_red_fade_in, led_green_fade_in, led_blue_fade_in    
 var bit  timer_tick, rc_active
 
 ; ========================= Functions and Procedures ==========================
@@ -159,7 +159,7 @@ function give_random_brightness() return byte is
    
    var byte random_brightness
    
-   random_brightness = byte(give_random_word())
+   random_brightness = byte(give_random_word()) % (MAX_BRIGHT + 1)
    if (random_brightness < MIN_BRIGHT) then
       random_brightness = random_brightness + MIN_BRIGHT
    end if 
@@ -175,7 +175,7 @@ function give_random_on_time() return word is
 
    var word random_time
    
-   random_time = give_random_word() % MAX_ON_TIME
+   random_time = give_random_word() % (MAX_ON_TIME + 1)
 
    if (random_time < MIN_ON_TIME) then
       random_time = random_time + MIN_ON_TIME
@@ -196,15 +196,15 @@ procedure led_init() is
 
    ; Initialze the RGB leds.
    ; Red.
-   led_red_max_bright = 0
+   led_red_brightness = 0
    led_red_on_time = NO_ON_TIME
    led_red_fade_in = FALSE    
    ; Green.
-   led_green_max_bright = 0
+   led_green_brightness = 0
    led_green_on_time = NO_ON_TIME
    led_green_fade_in = FALSE    
    ; Blue.
-   led_blue_max_bright = 0
+   led_blue_brightness = 0
    led_blue_on_time = NO_ON_TIME
    led_blue_fade_in = FALSE   
  
@@ -265,32 +265,32 @@ procedure pwm_cycle is pragma interrupt
          led_blue_timer = led_blue_duty_cycle
 
          ; Only turn LED on if it has a duty cycle to prevent flashing.
-         if (led_red_timer >= MIN_BRIGHT) then
+         if (led_red_timer > STEP_BRIGHT) then
             led_red = LED_ON
          end if
-         if (led_green_timer >= MIN_BRIGHT) then
+         if (led_green_timer > STEP_BRIGHT) then
             led_green = LED_ON
          end if
-         if (led_blue_timer >= MIN_BRIGHT) then
+         if (led_blue_timer > STEP_BRIGHT) then
             led_blue = LED_ON
          end if
       else
          pwm_period = pwm_period - 1
       end if
       
-      ; If the timer of the LED is at the lowest brightness 
-      ; then the duty cycle time has passed.
-      if (led_red_timer >= MIN_BRIGHT) then
+      ; If the timer of the LED is at STEP_BRIGHT then the
+      ; duty cycle time has passed.
+      if (led_red_timer > STEP_BRIGHT) then
          led_red_timer = led_red_timer - STEP_BRIGHT
       else 
          led_red = LED_OFF
       end if 
-      if (led_green_timer >= MIN_BRIGHT) then
+      if (led_green_timer > STEP_BRIGHT) then
          led_green_timer = led_green_timer - STEP_BRIGHT
       else 
          led_green = LED_OFF
       end if 
-      if (led_blue_timer >= MIN_BRIGHT) then
+      if (led_blue_timer > STEP_BRIGHT) then
          led_blue_timer = led_blue_timer - STEP_BRIGHT
       else 
          led_blue = LED_OFF
@@ -363,10 +363,11 @@ forever Loop
       timer_tick = FALSE
       
       ; Check if we need to change the colors of the LEDs and the on-time.
+      ; Check if we need to change the colors of the LEDs and the on-time.
       if (led_red_on_time == NO_ON_TIME) then
          new_brightness = give_random_brightness()
-         led_red_fade_in = (new_brightness > led_red_max_bright)
-         led_red_max_bright = new_brightness
+         led_red_fade_in = (new_brightness > led_red_brightness)
+         led_red_brightness = new_brightness
          led_red_on_time = give_random_on_time() 
       else
          led_red_on_time = led_red_on_time - 1
@@ -374,8 +375,8 @@ forever Loop
 
       if (led_green_on_time == NO_ON_TIME) then
          new_brightness = give_random_brightness()
-         led_green_fade_in = (new_brightness > led_green_max_bright)
-         led_green_max_bright = new_brightness
+         led_green_fade_in = (new_brightness > led_green_brightness)
+         led_green_brightness = new_brightness
          led_green_on_time = give_random_on_time()  
       else
          led_green_on_time = led_green_on_time - 1
@@ -383,42 +384,37 @@ forever Loop
      
       if (led_blue_on_time == NO_ON_TIME) then
          new_brightness = give_random_brightness()
-         led_blue_fade_in = (new_brightness > led_blue_max_bright)
-         led_blue_max_bright = new_brightness
+         led_blue_fade_in = (new_brightness > led_blue_brightness)
+         led_blue_brightness = new_brightness
          led_blue_on_time = give_random_on_time() 
       else
          led_blue_on_time = led_blue_on_time - 1
       end if 
 
       ; Handle fade-in and fade-out of all LEDs. Fading is done in small steps.
+      ; and towards the new level. 
       if led_red_fade_in then
-         if (led_red_duty_cycle < led_red_max_bright) then
+         if (led_red_duty_cycle < led_red_brightness) then
             led_red_duty_cycle = led_red_duty_cycle + STEP_BRIGHT
          end if   
-      else  
-         if led_red_duty_cycle >= MIN_BRIGHT then
+      elsif (led_red_duty_cycle >= MIN_BRIGHT) then
             led_red_duty_cycle = led_red_duty_cycle - STEP_BRIGHT
-         end if     
       end if
       
       if led_green_fade_in then
-         if (led_green_duty_cycle < led_green_max_bright) then
+         if (led_green_duty_cycle < led_green_brightness) then
             led_green_duty_cycle = led_green_duty_cycle + STEP_BRIGHT
          end if     
-      else
-         if led_green_duty_cycle >= MIN_BRIGHT then
+      elsif (led_green_duty_cycle >= MIN_BRIGHT) then
             led_green_duty_cycle = led_green_duty_cycle - STEP_BRIGHT
-         end if     
       end if
    
       if led_blue_fade_in then
-         if (led_blue_duty_cycle < led_blue_max_bright) then
+         if (led_blue_duty_cycle < led_blue_brightness) then
             led_blue_duty_cycle = led_blue_duty_cycle + STEP_BRIGHT
          end if     
-      else
-         if led_blue_duty_cycle >= MIN_BRIGHT then
+      elsif (led_blue_duty_cycle >= MIN_BRIGHT) then
             led_blue_duty_cycle = led_blue_duty_cycle - STEP_BRIGHT
-         end if     
       end if
   
     end if ; timer_tick & !rc_active
